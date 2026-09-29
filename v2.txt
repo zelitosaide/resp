@@ -1,0 +1,68 @@
+CREATE OR REPLACE PROCEDURE LOAD_CCS_DATA_USAGE_245 AS
+    c_margem  CONSTANT NUMBER := 2000;    -- IDs recopiados por segurança
+    c_max_ids CONSTANT NUMBER := 20000;   -- tamanho máximo do lote por execução
+    v_corte   NUMBER;
+    v_prox    NUMBER;
+    v_limite  NUMBER;
+    v_lock    VARCHAR2(128);
+BEGIN
+    -- cadeado: se já houver uma execução a correr, sai sem fazer nada
+    DBMS_LOCK.ALLOCATE_UNIQUE('LOAD_CCS_DATA_USAGE_245', v_lock);
+    IF DBMS_LOCK.REQUEST(v_lock, DBMS_LOCK.X_MODE,
+                         timeout => 0, release_on_commit => TRUE) <> 0 THEN
+        RETURN;
+    END IF;
+
+    SELECT NVL(MAX(F_FI_ID), 1600765000) - c_margem   -- trocar pelo seu ID inicial
+      INTO v_corte
+      FROM SVC_ORDS_BDATA.CCS_DATA_USAGE@ORDS_DBLINK;
+
+    -- próximo ID que existe na staging (salta buracos de outros tipos de ficheiro)
+    SELECT MIN(F_FI_ID) INTO v_prox
+      FROM ODS.STG_CC_CCS_CDR
+     WHERE F_FI_ID > v_corte + c_margem;
+
+    v_limite := NVL(v_prox, v_corte) + c_max_ids;
+
+    DELETE FROM SVC_ORDS_BDATA.CCS_DATA_USAGE@ORDS_DBLINK
+     WHERE F_FI_ID > v_corte;
+
+    INSERT INTO SVC_ORDS_BDATA.CCS_DATA_USAGE@ORDS_DBLINK (
+        F_FI_ID, EVENT_START, EVENT_END, EVENT_TYPE, TARIFF_PLAN, MSISDN,
+        MTC_RECEPTOR, DURATION, INITIAL_VALUE_MB, CHARGED_VALUE_MB,
+        REMAINING_VALUE_MB, OFFER_NAME, EXPIRY_DATE, ROAMING_COUNTRY)
+    SELECT F_FI_ID,
+           CC_RECORD_OPENING_TIME, CC_RECORD_CLOSING_TIME, CC_RECORD_TYPE,
+           CC_PROVIDER_ID, CC_MSISDN, CC_OTHER_PARTY_ADDRESS, CC_CC_TIME,
+           ROUND(CC_BALANCE_BEFORE      / 1048576, 2),
+           ROUND(CC_CC_TOTAL_OCTETS     / 1048576, 2),
+           ROUND(CC_COUNTER_FINAL_VALUE / 1048576, 2),
+           CC_OFFER_NAME, CC_EXPIRY_DATE, CC_ROAMING_COUNTRY
+      FROM ODS.STG_CC_CCS_CDR
+     WHERE F_FI_ID >  v_corte
+       AND F_FI_ID <= v_limite
+       AND CC_DUP   = 'N';
+
+    COMMIT;   -- grava e liberta o cadeado
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
+/
+
+
+---
+
+@dag(
+    dag_id="DATA_STATEMENT",
+    schedule="0 * * * *",                 # de hora a hora
+    start_date=pendulum.datetime(2026, 1, 1, tz="Africa/Maputo"),
+    catchup=False,                        # não acumula execuções em atraso
+    max_active_runs=1,                    # nunca duas DAG runs em paralelo
+    default_args={
+        "retries": 1,
+        "retry_delay": timedelta(minutes=5),
+        "execution_timeout": timedelta(minutes=50),  # menor que o intervalo do schedule
+    },
+)
