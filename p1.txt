@@ -1,30 +1,136 @@
-SELECT FI_FT_ID,
-       COUNT(*)      AS ficheiros,
-       MIN(FI_NAME)  AS exemplo_nome
-  FROM INSIGHT.F_FI_FILE
- WHERE FI_ID > 1600765000
- GROUP BY FI_FT_ID;
+No destino, uma única vez:
 
----
+sql
+ALTER TABLE SVC_ORDS_BDATA.CCS_DATA_USAGE ADD (F_FI_ID NUMBER);
+CREATE INDEX IX_CCS_DATA_USAGE_FIID ON SVC_ORDS_BDATA.CCS_DATA_USAGE (F_FI_ID);
 
-SELECT F_FI_ID,
-       COUNT(*)                                     AS linhas,
-       SUM(CASE WHEN CC_DUP = 'N' THEN 1 ELSE 0 END) AS nao_dup
-  FROM ODS.STG_CC_CCS_CDR
- WHERE F_FI_ID IN (1600765209, 1600765208, 1600765192,
-                   1600765191, 1600765190, 1600765188)
- GROUP BY F_FI_ID;
 
----
 
-SELECT FI_ID,
-       FI_FT_ID,
-       TO_CHAR(FI_DATE, 'YYYY-MM-DD HH24:MI:SS')             AS fi_date,
-       FI_APPROVED,
-       FI_RECORDS,
-       TO_CHAR(FI_BACKUP_MOVE_TIME, 'YYYY-MM-DD HH24:MI:SS') AS backup_move,
-       FI_PARENT_FI_ID,
-       FI_NAME
-  FROM INSIGHT.F_FI_FILE
- WHERE FI_ID IN (1600765209, 1600765208, 1600765192,
-                 1600765191, 1600765190, 1600765188);
+----
+
+
+Procedure (no destino):
+
+sql
+CREATE OR REPLACE PROCEDURE LOAD_CCS_DATA_USAGE AS
+    c_margem CONSTANT NUMBER := 2000;   -- recopia os últimos IDs, por segurança
+    v_corte  NUMBER;
+BEGIN
+    SELECT NVL(MAX(F_FI_ID), 1600760000) - c_margem   -- valor inicial só para a 1ª execução
+      INTO v_corte
+      FROM SVC_ORDS_BDATA.CCS_DATA_USAGE;
+
+    DELETE FROM SVC_ORDS_BDATA.CCS_DATA_USAGE
+     WHERE F_FI_ID > v_corte;
+
+    INSERT INTO SVC_ORDS_BDATA.CCS_DATA_USAGE (
+        F_FI_ID, EVENT_START, EVENT_END, EVENT_TYPE, TARIFF_PLAN, MSISDN,
+        MTC_RECEPTOR, DURATION, INITIAL_VALUE_MB, CHARGED_VALUE_MB,
+        REMAINING_VALUE_MB, OFFER_NAME, EXPIRY_DATE, ROAMING_COUNTRY)
+    SELECT F_FI_ID,
+           CC_RECORD_OPENING_TIME,
+           CC_RECORD_CLOSING_TIME,
+           CC_RECORD_TYPE,
+           CC_PROVIDER_ID,
+           CC_MSISDN,
+           CC_OTHER_PARTY_ADDRESS,
+           CC_CC_TIME,
+           ROUND(CC_BALANCE_BEFORE      / 1048576, 2),
+           ROUND(CC_CC_TOTAL_OCTETS     / 1048576, 2),
+           ROUND(CC_COUNTER_FINAL_VALUE / 1048576, 2),
+           CC_OFFER_NAME,
+           CC_EXPIRY_DATE,
+           CC_ROAMING_COUNTRY
+      FROM ODS.STG_CC_CCS_CDR@ODS_DBLINK
+     WHERE F_FI_ID > v_corte          -- usa o índice da origem
+       AND CC_DUP  = 'N';             -- substitui o DISTINCT
+
+    COMMIT;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
+/
+
+
+
+---- origem
+
+CREATE OR REPLACE PROCEDURE LOAD_CCS_DATA_USAGE_245 AS
+    c_margem CONSTANT NUMBER := 2000;
+    v_corte  NUMBER;
+BEGIN
+    SELECT NVL(MAX(F_FI_ID), :ID_INICIAL) - c_margem   -- trocar pelo ID inicial real
+      INTO v_corte
+      FROM SVC_ORDS_BDATA.CCS_DATA_USAGE@ORDS_DBLINK;
+
+    DELETE FROM SVC_ORDS_BDATA.CCS_DATA_USAGE@ORDS_DBLINK
+     WHERE F_FI_ID > v_corte;
+
+    INSERT INTO SVC_ORDS_BDATA.CCS_DATA_USAGE@ORDS_DBLINK (
+        F_FI_ID, EVENT_START, EVENT_END, EVENT_TYPE, TARIFF_PLAN, MSISDN,
+        MTC_RECEPTOR, DURATION, INITIAL_VALUE_MB, CHARGED_VALUE_MB,
+        REMAINING_VALUE_MB, OFFER_NAME, EXPIRY_DATE, ROAMING_COUNTRY)
+    SELECT F_FI_ID,
+           CC_RECORD_OPENING_TIME,
+           CC_RECORD_CLOSING_TIME,
+           CC_RECORD_TYPE,
+           CC_PROVIDER_ID,
+           CC_MSISDN,
+           CC_OTHER_PARTY_ADDRESS,
+           CC_CC_TIME,
+           ROUND(CC_BALANCE_BEFORE      / 1048576, 2),
+           ROUND(CC_CC_TOTAL_OCTETS     / 1048576, 2),
+           ROUND(CC_COUNTER_FINAL_VALUE / 1048576, 2),
+           CC_OFFER_NAME,
+           CC_EXPIRY_DATE,
+           CC_ROAMING_COUNTRY
+      FROM ODS.STG_CC_CCS_CDR               -- local: sem DB link na leitura
+     WHERE F_FI_ID > v_corte
+       AND CC_DUP  = 'N';
+
+    COMMIT;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
+/
+
+
+
+----
+
+
+from datetime import timedelta
+
+import pendulum
+from airflow.providers.oracle.hooks.oracle import OracleHook
+from airflow.sdk import dag, task
+
+
+@dag(
+    dag_id="DATA_STATEMENT",
+    schedule="*/15 * * * *",          # a cada 15 minutos
+    start_date=pendulum.datetime(2026, 1, 1, tz="Africa/Maputo"),
+    catchup=False,
+    max_active_runs=1,                # nunca duas execuções ao mesmo tempo
+    default_args={
+        "retries": 2,
+        "retry_delay": timedelta(minutes=2),
+        "execution_timeout": timedelta(minutes=30),  # corta execuções presas
+    },
+)
+def ccs_data_usage_load():
+
+    @task
+    def load_data_usage():
+        hook = OracleHook(oracle_conn_id="ORDS")   # ligação à BD de DESTINO
+        with hook.get_conn() as conn, conn.cursor() as cur:
+            cur.callproc("SVC_ORDS_BDATA.LOAD_CCS_DATA_USAGE")
+
+    load_data_usage()
+
+
+ccs_data_usage_load()
