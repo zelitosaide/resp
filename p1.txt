@@ -1,0 +1,29 @@
+SELECT f.FI_FT_ID,
+       COUNT(*)                      AS ficheiros,
+       COUNT(s.F_FI_ID)              AS ficheiros_com_linhas_na_stg,
+       MIN(f.FI_NAME)                AS exemplo_nome
+  FROM INSIGHT.F_FI_FILE f
+  LEFT JOIN (SELECT DISTINCT F_FI_ID
+               FROM ODS.STG_CC_CCS_CDR
+              WHERE F_FI_ID > 1600765209 - 2000) s
+         ON s.F_FI_ID = f.FI_ID
+ WHERE f.FI_ID > 1600765209 - 2000
+ GROUP BY f.FI_FT_ID
+ ORDER BY 3 DESC;
+
+ ----
+
+ SELECT f.FI_ID,
+       TO_CHAR(f.FI_DATE, 'YYYY-MM-DD HH24:MI:SS')             AS fi_date,
+       f.FI_APPROVED,
+       f.FI_RECORDS,
+       TO_CHAR(f.FI_BACKUP_MOVE_TIME, 'YYYY-MM-DD HH24:MI:SS') AS backup_move,
+       f.FI_PARENT_FI_ID,
+       (SELECT COUNT(*) FROM ODS.STG_CC_CCS_CDR s
+         WHERE s.F_FI_ID = f.FI_ID)                             AS linhas_stg,
+       (SELECT COUNT(*) FROM ODS.STG_CC_CCS_CDR s
+         WHERE s.F_FI_ID = f.FI_ID AND s.CC_DUP = 'N')          AS linhas_nao_dup
+  FROM INSIGHT.F_FI_FILE f
+ WHERE f.FI_FT_ID = :ft
+ ORDER BY f.FI_ID DESC
+ FETCH FIRST 30 ROWS ONLY;
